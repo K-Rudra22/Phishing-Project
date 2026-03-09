@@ -1,9 +1,9 @@
 streamlit
-lightgbm
-scikit-learn
+joblib
 numpy
 pandas
-plotly
+scikit-learn
+lightgbm
 scipy
-joblib
+plotly
 shap
