@@ -2,8 +2,6 @@
 
 A machine learning system for classifying phishing emails using **LightGBM** with a dynamic **Sender Trust** scoring mechanism. Built as a mini-project comparing Logistic Regression and LightGBM across five real-world email datasets.
 
-Live demo → [Streamlit App](https://your-app-url.streamlit.app) *(replace with your deployed URL)*
-
 ---
 
 ## Results
@@ -15,11 +13,11 @@ Live demo → [Streamlit App](https://your-app-url.streamlit.app) *(replace with
 | Phishing Recall | 0.96 | **1.00** |
 | Phishing Precision | 0.97 | **0.98** |
 | Phishing F1 | 0.96 | **0.99** |
-| External ROC AUC | 0.857 | 1.00 ⚠️ |
-| External Accuracy | 70% | 100% ⚠️ |
+| External ROC AUC | 0.857 | 1.00  |
+| External Accuracy | 70% | 100%  |
 | Training Time | 325s | 408s |
 
-> ⚠️ LightGBM's external score reflects in-sample performance — the 2,000 external validation emails were included in training to match the LR pipeline. The **internal 80/20 split (18,886 emails)** is the clean benchmark for LGB.
+> LightGBM's external score reflects in-sample performance — the 2,000 external validation emails were included in training to match the LR pipeline. The **internal 80/20 split (18,886 emails)** is the clean benchmark for LGB.
 
 ---
 
