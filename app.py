@@ -11,17 +11,16 @@ import sqlite3
 # LOAD ARTIFACTS
 # ============================
 
-# FIX 1: was "model_sender_trust_unified.pkl" (LR name) — notebook saves lgb_phishing_model.pkl
 model      = joblib.load("lgb_phishing_model.pkl")
 vectorizer = joblib.load("tfidf_vectorizer.pkl")
 scaler     = joblib.load("structural_scaler.pkl")
 
 GLOBAL_TRUST_PRIOR = 0.5
-ALPHA          = 2
+ALPHA          = 2.0
 AUTO_THRESHOLD = 0.8
 
 # ============================
-# SQLITE DATABASE (CACHED)
+# SQLITE DATABASE
 # ============================
 
 @st.cache_resource
@@ -31,8 +30,8 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sender_reputation (
             sender      TEXT PRIMARY KEY,
-            legit_count INTEGER,
-            phish_count INTEGER
+            legit_count INTEGER DEFAULT 0,
+            phish_count INTEGER DEFAULT 0
         )
     """)
     conn.commit()
@@ -42,16 +41,13 @@ conn, cursor = init_db()
 
 # ============================
 # FEATURE ENGINEERING
-# Must exactly mirror notebook Cell 7 (clean_text) and Cell 9 (extract_features_correct)
-# FIX 2: added '.cn' to suspicious_tlds (was missing vs notebook — notebook has 6, app had 5)
-# FIX 3: urgent_words uses 'suspended' not 'suspend' (matches notebook training config exactly)
+# Mirrors notebook Cell 7 + Cell 9 exactly
 # ============================
 
 SUSPICIOUS_TLDS = ['.ru', '.cn', '.tk', '.xyz', '.top', '.click']
 URGENT_WORDS    = ['urgent', 'immediately', 'action required', 'verify', 'suspended']
 
 def clean_text(text):
-    """Mirrors notebook Cell 7 — used for TF-IDF input."""
     text = str(text).lower()
     text = re.sub(r"http\S+|www\.\S+", " URL ", text)
     text = re.sub(r"\S+@\S+", " EMAIL ", text)
@@ -60,15 +56,12 @@ def clean_text(text):
     return text.strip()
 
 def extract_structural_features(text):
-    """Mirrors notebook Cell 9 — returns 7 features in exact training order."""
     text = str(text)
-
     urls            = re.findall(r'https?://\S+|www\.\S+', text)
     num_urls        = len(urls)
     domains         = []
     has_ip          = 0
     suspicious_flag = 0
-
     for url in urls:
         try:
             domain = urlparse(url).netloc
@@ -79,28 +72,22 @@ def extract_structural_features(text):
                 suspicious_flag = 1
         except Exception:
             continue
-
-    num_unique_domains = len(set(domains))
-    exclamation_count  = text.count("!")
-    uppercase_ratio    = sum(1 for c in text if c.isupper()) / max(len(text), 1)
-    urgent_flag        = int(any(w in text.lower() for w in URGENT_WORDS))
-
     return [
         num_urls,
-        num_unique_domains,
+        len(set(domains)),
         has_ip,
         suspicious_flag,
-        exclamation_count,
-        uppercase_ratio,
-        urgent_flag,
+        text.count("!"),
+        sum(1 for c in text if c.isupper()) / max(len(text), 1),
+        int(any(w in text.lower() for w in URGENT_WORDS)),
     ]
 
 # ============================
-# TRUST SCORE (SQLite-backed)
+# TRUST SCORE
 # ============================
 
 def get_trust_score(sender):
-    if not sender:
+    if not sender or not sender.strip():
         return GLOBAL_TRUST_PRIOR
     sender = sender.strip().lower()
     cursor.execute(
@@ -115,22 +102,29 @@ def get_trust_score(sender):
 
 # ============================
 # UPDATE REPUTATION
+# BUG FIX: This now ONLY runs when the human explicitly clicks a button.
+# Auto-learning is removed — it was firing on every Analyze click and
+# overriding/diluting manual corrections before the user could act.
 # ============================
 
 def update_reputation(sender, true_label):
-    if not sender:
+    """
+    true_label: 0 = user says Legitimate → increases trust
+                1 = user says Phishing   → decreases trust
+    """
+    if not sender or not sender.strip():
         return
     sender = sender.strip().lower()
     cursor.execute(
         "SELECT legit_count, phish_count FROM sender_reputation WHERE sender=?",
         (sender,)
     )
-    row = cursor.fetchone()
+    row    = cursor.fetchone()
     legit, phish = row if row else (0, 0)
     if true_label == 0:
-        legit += 1
+        legit += 1   # user says legit → trust goes UP
     else:
-        phish += 1
+        phish += 1   # user says phishing → trust goes DOWN
     cursor.execute(
         "INSERT OR REPLACE INTO sender_reputation (sender, legit_count, phish_count) VALUES (?, ?, ?)",
         (sender, legit, phish)
@@ -139,37 +133,43 @@ def update_reputation(sender, true_label):
 
 # ============================
 # BUILD FEATURE MATRIX
-# Mirrors notebook Cell 14 exactly:
-#   hstack([X_text(3000), X_struct_scaled(7), trust(1)]) → 3008 cols
+# Mirrors notebook Cell 14: hstack([X_text(3000), struct_scaled(7), trust(1)]) = 3008
 # ============================
 
 def build_feature_matrix(email_text, trust_score):
     cleaned       = clean_text(email_text)
-    X_text        = vectorizer.transform([cleaned])                  # (1, 3000) sparse
+    X_text        = vectorizer.transform([cleaned])
     struct        = extract_structural_features(email_text)
-    struct_scaled = scaler.transform(np.array(struct).reshape(1,-1)) # (1, 7) scaled
-    trust_array   = np.array([[trust_score]])                         # (1, 1)
-    X_numeric     = np.hstack([struct_scaled, trust_array])           # (1, 8)
-    X_final       = hstack([X_text, csr_matrix(X_numeric)]).tocsr()  # (1, 3008)
+    struct_scaled = scaler.transform(np.array(struct).reshape(1, -1))
+    trust_array   = np.array([[trust_score]])
+    X_numeric     = np.hstack([struct_scaled, trust_array])
+    X_final       = hstack([X_text, csr_matrix(X_numeric)]).tocsr()
     return X_final, X_text, struct
 
 # ============================
-# LGB FEATURE IMPORTANCE (cached — runs once per session)
-# FIX 4: LightGBM has no coef_ — use booster_ gain importance instead
-# Tabs 4 and 7 were completely blank before this fix
+# LGB FEATURE IMPORTANCE (cached)
 # ============================
 
 @st.cache_resource
 def get_feature_importance():
     gain  = model.booster_.feature_importance(importance_type='gain')
-    names = model.feature_name_  # set in notebook via feature_name=all_feature_names
-
-    n_tfidf = len(vectorizer.get_feature_names_out())  # 3000
-
+    names = model.feature_name_
+    n_tfidf = len(vectorizer.get_feature_names_out())
     tfidf_importance   = {names[i]: gain[i] for i in range(n_tfidf)}
     numeric_importance = {names[i]: gain[i] for i in range(n_tfidf, len(names))}
-
     return tfidf_importance, numeric_importance
+
+# ============================
+# SESSION STATE
+# BUG FIX: Store analysis results in session_state so they persist across
+# button clicks (Streamlit reruns entire script on every interaction).
+# Without this, clicking "Mark as Phishing" wipes out all the tab content.
+# ============================
+
+if "results" not in st.session_state:
+    st.session_state.results = None
+if "reputation_msg" not in st.session_state:
+    st.session_state.reputation_msg = None
 
 # ============================
 # UI
@@ -179,37 +179,52 @@ st.set_page_config(page_title="Sender-Trust Phishing Detection", layout="wide")
 st.title("Sender-Trust Aware Phishing Detection")
 st.caption("LightGBM · TF-IDF + Structural Features + Dynamic Sender Trust")
 
-sender_input = st.text_input("Sender Email")
-email_text   = st.text_area("Email Content", height=220)
+sender_input = st.text_input("Sender Email",
+                              value=st.session_state.get("sender_input", ""))
+email_text   = st.text_area("Email Content", height=220,
+                             value=st.session_state.get("email_text", ""))
 
 if st.button("Analyze Email"):
-
     if not email_text.strip():
         st.warning("Please enter email content.")
         st.stop()
 
+    # Save inputs so they persist after button clicks
+    st.session_state.sender_input = sender_input
+    st.session_state.email_text   = email_text
+    st.session_state.reputation_msg = None  # clear old message
+
     trust_score = get_trust_score(sender_input)
     trust_pct   = trust_score * 100
 
-    # Full matrix (with trust)
     X_final, X_text, struct_features = build_feature_matrix(email_text, trust_score)
-
-    # Text-only matrix (trust set to 0, same shape → 3008 cols, fair comparison)
-    X_text_only, _, _ = build_feature_matrix(email_text, 0.0)
+    X_text_only, _, _                = build_feature_matrix(email_text, 0.0)
 
     probability   = model.predict_proba(X_final)[0][1]
     prob_pct      = probability * 100
     text_prob_pct = model.predict_proba(X_text_only)[0][1] * 100
 
-    # Auto-learning: update reputation on high-confidence predictions
-    if probability > AUTO_THRESHOLD:
-        update_reputation(sender_input, 1)
-    elif probability < (1 - AUTO_THRESHOLD):
-        update_reputation(sender_input, 0)
+    # Store all results — persists across reruns caused by button clicks
+    st.session_state.results = {
+        "sender_input":   sender_input,
+        "trust_score":    trust_score,
+        "trust_pct":      trust_pct,
+        "probability":    probability,
+        "prob_pct":       prob_pct,
+        "text_prob_pct":  text_prob_pct,
+        "struct_features": struct_features,
+    }
 
-    # ============================
-    # TABS
-    # ============================
+# ── Show results if we have them ─────────────────────────────────────────────
+
+if st.session_state.results:
+    r             = st.session_state.results
+    prob_pct      = r["prob_pct"]
+    text_prob_pct = r["text_prob_pct"]
+    trust_score   = r["trust_score"]
+    trust_pct     = r["trust_pct"]
+    struct_features = r["struct_features"]
+    stored_sender = r["sender_input"]
 
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "Prediction",
@@ -249,47 +264,86 @@ if st.button("Analyze Email"):
         else:
             st.success("Low Risk: Likely Legitimate")
 
-        st.write(f"Sender Trust Score: {trust_pct:.1f}%")
+        st.write(f"**Sender Trust Score:** {trust_pct:.1f}%")
         st.divider()
+
+        # ── Manual ground truth buttons ───────────────────────────────────────
+        # BUG FIX: Trust update is 100% user-controlled.
+        # Legitimate → legit_count++ → trust score rises next analysis
+        # Phishing   → phish_count++ → trust score falls next analysis
+        # The update writes to SQLite immediately and persists across sessions.
+
         st.subheader("Confirm Ground Truth")
+        st.caption("Your feedback updates this sender's trust score for future emails.")
 
         col1, col2 = st.columns(2)
-        if col1.button("Mark as Legitimate"):
-            update_reputation(sender_input, 0)
-            st.success("Reputation updated")
-        if col2.button("Mark as Phishing"):
-            update_reputation(sender_input, 1)
-            st.success("Reputation updated")
+
+        if col1.button("✅ Mark as Legitimate", use_container_width=True):
+            update_reputation(stored_sender, 0)   # 0 = legit → trust UP
+            new_trust = get_trust_score(stored_sender)
+            st.session_state.results["trust_score"] = new_trust
+            st.session_state.results["trust_pct"]   = new_trust * 100
+            st.session_state.reputation_msg = ("success",
+                f"✅ Marked as Legitimate. Trust updated: {new_trust*100:.1f}%")
+
+        if col2.button("🚨 Mark as Phishing", use_container_width=True):
+            update_reputation(stored_sender, 1)   # 1 = phishing → trust DOWN
+            new_trust = get_trust_score(stored_sender)
+            st.session_state.results["trust_score"] = new_trust
+            st.session_state.results["trust_pct"]   = new_trust * 100
+            st.session_state.reputation_msg = ("error",
+                f"🚨 Marked as Phishing. Trust updated: {new_trust*100:.1f}%")
+
+        if st.session_state.reputation_msg:
+            msg_type, msg_text = st.session_state.reputation_msg
+            if msg_type == "success":
+                st.success(msg_text)
+            else:
+                st.error(msg_text)
 
     # ── TAB 2 — Behavior Analysis ─────────────────────────────────────────────
 
     with tab2:
         st.subheader("Sender Trust")
-        st.progress(float(trust_score))
-        st.write(f"Trust Score: {trust_pct:.1f}%")
+
+        # Refresh trust from DB in case user just updated it
+        live_trust = get_trust_score(stored_sender)
+        st.progress(float(live_trust))
+        st.write(f"**Trust Score:** {live_trust*100:.1f}%")
 
         st.divider()
         st.subheader("Sender History")
-        sender_key = sender_input.strip().lower() if sender_input else None
-        if sender_key:
+
+        if stored_sender and stored_sender.strip():
             cursor.execute(
                 "SELECT legit_count, phish_count FROM sender_reputation WHERE sender=?",
-                (sender_key,)
+                (stored_sender.strip().lower(),)
             )
             row = cursor.fetchone()
             if row:
                 legit, phish = row
-                st.write(f"Emails seen: {legit + phish}  |  Legit: {legit}  |  Phishing: {phish}")
+                total = legit + phish
+                st.write(f"Emails reviewed: **{total}**")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total", total)
+                c2.metric("Marked Legit", legit)
+                c3.metric("Marked Phishing", phish)
+
+                # Show how trust changed
+                trust_formula = (legit + ALPHA) / (legit + phish + 2 * ALPHA)
+                st.caption(f"Trust = (legit + {int(ALPHA)}) / (total + {int(2*ALPHA)}) "
+                           f"= ({legit} + {int(ALPHA)}) / ({total} + {int(2*ALPHA)}) "
+                           f"= **{trust_formula*100:.1f}%**")
             else:
-                st.write("No history for this sender yet.")
+                st.info("No manual feedback recorded for this sender yet.")
         else:
-            st.write("Enter a sender email to see history.")
+            st.info("Enter a sender email to see their history.")
 
     # ── TAB 3 — Feature Visualization (radar) ────────────────────────────────
 
     with tab3:
-        labels = ["URLs", "Domains", "IP", "TLD",
-                  "Exclaim", "Uppercase", "Urgency", "Trust"]
+        labels = ["URLs", "Domains", "IP", "Susp. TLD",
+                  "Exclamation", "Uppercase", "Urgency", "Trust"]
         values = [
             min(struct_features[0], 5),
             min(struct_features[1], 5),
@@ -300,25 +354,20 @@ if st.button("Analyze Email"):
             struct_features[6] * 5,
             trust_score * 5,
         ]
-
         fig = go.Figure()
-        fig.add_trace(go.Scatterpolar(r=values, theta=labels, fill='toself'))
+        fig.add_trace(go.Scatterpolar(r=values, theta=labels, fill='toself',
+                                      line_color="#f97316"))
         fig.update_layout(
             polar=dict(radialaxis=dict(visible=True, range=[0, 5])),
             height=450
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── TAB 4 — Feature Contribution ─────────────────────────────────────────
-    # FIX 4: was if hasattr(model,"coef_") — always False for LGB → tab was blank
-    # Now shows gain-based importance for the 8 numeric + trust features
+    # ── TAB 4 — Feature Contribution ──────────────────────────────────────────
 
     with tab4:
         st.subheader("Numeric & Trust Feature Importance")
-        st.caption(
-            "LightGBM uses gain-based importance (total information gained by each feature "
-            "across all trees) rather than linear coefficients."
-        )
+        st.caption("Information gain each feature contributed across all training trees.")
 
         _, numeric_importance = get_feature_importance()
 
@@ -332,41 +381,32 @@ if st.button("Analyze Email"):
             "urgent_flag":        "Urgency Flag",
             "sender_trust":       "Sender Trust",
         }
-
         feat_labels = [display_names.get(k, k) for k in numeric_importance]
         feat_gains  = list(numeric_importance.values())
         colors      = ["#f97316" if "Trust" in n else "#34d399" for n in feat_labels]
 
         fig = go.Figure(go.Bar(
-            x=feat_gains,
-            y=feat_labels,
-            orientation='h',
-            marker_color=colors,
+            x=feat_gains, y=feat_labels, orientation='h', marker_color=colors,
         ))
-        fig.update_layout(
-            height=420,
-            xaxis_title="Gain (Information)",
-            yaxis=dict(autorange="reversed"),
-        )
+        fig.update_layout(height=420, xaxis_title="Gain",
+                          yaxis=dict(autorange="reversed"))
         st.plotly_chart(fig, use_container_width=True)
 
     # ── TAB 5 — Model Comparison ──────────────────────────────────────────────
 
     with tab5:
-        col1, col2 = st.columns(2)
-        col1.metric("Text-only Probability",  f"{text_prob_pct:.1f}%")
-        col2.metric("Trust-Aware Probability", f"{prob_pct:.1f}%",
-                    delta=f"{prob_pct - text_prob_pct:+.1f}%")
+        c1, c2 = st.columns(2)
+        c1.metric("Text-only Probability",  f"{text_prob_pct:.1f}%")
+        c2.metric("Trust-Aware Probability", f"{prob_pct:.1f}%",
+                  delta=f"{prob_pct - text_prob_pct:+.1f}%")
 
         fig = go.Figure(go.Bar(
             x=["Text Only", "Trust-Aware"],
             y=[text_prob_pct, prob_pct],
             marker_color=["#94a3b8", "#f97316"],
         ))
-        fig.update_layout(
-            yaxis=dict(range=[0, 100], title="Phishing Probability (%)"),
-            height=300,
-        )
+        fig.update_layout(yaxis=dict(range=[0, 100], title="Phishing Probability (%)"),
+                          height=300)
         st.plotly_chart(fig, use_container_width=True)
 
     # ── TAB 6 — Risk Breakdown ────────────────────────────────────────────────
@@ -376,31 +416,24 @@ if st.button("Analyze Email"):
         st.metric("Text-Based Risk",        f"{text_prob_pct:.1f}%")
         st.metric("Sender Trust Influence", f"{(prob_pct - text_prob_pct):+.1f}%")
 
-        if prob_pct > text_prob_pct:
-            st.write("Sender reputation **increased** risk.")
-        elif prob_pct < text_prob_pct:
-            st.write("Sender reputation **reduced** risk.")
+        delta = prob_pct - text_prob_pct
+        if delta > 0.5:
+            st.write("⬆️ Sender reputation **increased** phishing risk.")
+        elif delta < -0.5:
+            st.write("⬇️ Sender reputation **reduced** phishing risk.")
         else:
-            st.write("Sender reputation had no effect.")
+            st.write("➡️ Sender reputation had minimal effect.")
 
     # ── TAB 7 — Top Word Signals ──────────────────────────────────────────────
-    # FIX 4: was if hasattr(model,"coef_") — always False for LGB → tab was blank
-    # Now uses LGB gain importance to show top TF-IDF words globally,
-    # and highlights which of those top words appear in this specific email
 
     with tab7:
         st.subheader("Top Word Signals")
-        st.caption(
-            "Ranked by information gain across all training trees. "
-            "🔴 = this word is present in the submitted email."
-        )
+        st.caption("Ranked by training gain. 🔴 = present in submitted email.")
 
         tfidf_importance, _ = get_feature_importance()
+        top_words    = sorted(tfidf_importance.items(), key=lambda x: x[1], reverse=True)[:20]
+        email_tokens = set(clean_text(st.session_state.get("email_text", "")).split())
 
-        top_words   = sorted(tfidf_importance.items(), key=lambda x: x[1], reverse=True)[:20]
-        email_tokens = set(clean_text(email_text).split())
-
-        st.subheader("Top 20 Most Informative Words")
         for word, gain in top_words:
             marker = "🔴" if word in email_tokens else "⬜"
             st.write(f"{marker} **{word}** — gain: {gain:,.0f}")
