@@ -204,27 +204,49 @@ if st.button("Analyze Email"):
     prob_pct      = probability * 100
     text_prob_pct = model.predict_proba(X_text_only)[0][1] * 100
 
+    # ── Per-email word contributions via TF-IDF weight × global gain ──────────
+    # SHAP on 3008 features is too slow for a live app (~30s).
+    # Instead: for each word present in this email, multiply its TF-IDF weight
+    # by the LGB gain for that feature. This gives a fast, meaningful per-email
+    # signal: words the model finds important AND that actually appear here.
+    tfidf_importance, _ = get_feature_importance()
+    tfidf_names  = vectorizer.get_feature_names_out()
+    tfidf_vector = X_text.toarray().flatten()   # (3000,) weights for this email
+
+    word_scores = []
+    for idx, weight in enumerate(tfidf_vector):
+        if weight > 0:
+            word  = tfidf_names[idx]
+            gain  = tfidf_importance.get(word, 0)
+            score = float(weight * gain)   # higher = more influential in this email
+            word_scores.append((word, score, weight, gain))
+
+    # Sort by score descending — top = most phishing-influential in this email
+    word_scores.sort(key=lambda x: x[1], reverse=True)
+
     # Store all results — persists across reruns caused by button clicks
     st.session_state.results = {
-        "sender_input":   sender_input,
-        "trust_score":    trust_score,
-        "trust_pct":      trust_pct,
-        "probability":    probability,
-        "prob_pct":       prob_pct,
-        "text_prob_pct":  text_prob_pct,
+        "sender_input":    sender_input,
+        "trust_score":     trust_score,
+        "trust_pct":       trust_pct,
+        "probability":     probability,
+        "prob_pct":        prob_pct,
+        "text_prob_pct":   text_prob_pct,
         "struct_features": struct_features,
+        "word_scores":     word_scores,
     }
 
 # ── Show results if we have them ─────────────────────────────────────────────
 
 if st.session_state.results:
-    r             = st.session_state.results
-    prob_pct      = r["prob_pct"]
-    text_prob_pct = r["text_prob_pct"]
-    trust_score   = r["trust_score"]
-    trust_pct     = r["trust_pct"]
+    r               = st.session_state.results
+    prob_pct        = r["prob_pct"]
+    text_prob_pct   = r["text_prob_pct"]
+    trust_score     = r["trust_score"]
+    trust_pct       = r["trust_pct"]
     struct_features = r["struct_features"]
-    stored_sender = r["sender_input"]
+    stored_sender   = r["sender_input"]
+    word_scores     = r.get("word_scores", [])
 
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "Prediction",
@@ -278,21 +300,21 @@ if st.session_state.results:
 
         col1, col2 = st.columns(2)
 
-        if col1.button("✅ Mark as Legitimate", use_container_width=True):
+        if col1.button(" Mark as Legitimate", use_container_width=True):
             update_reputation(stored_sender, 0)   # 0 = legit → trust UP
             new_trust = get_trust_score(stored_sender)
             st.session_state.results["trust_score"] = new_trust
             st.session_state.results["trust_pct"]   = new_trust * 100
             st.session_state.reputation_msg = ("success",
-                f"✅ Marked as Legitimate. Trust updated: {new_trust*100:.1f}%")
+                f" Marked as Legitimate. Trust updated: {new_trust*100:.1f}%")
 
-        if col2.button("🚨 Mark as Phishing", use_container_width=True):
+        if col2.button(" Mark as Phishing", use_container_width=True):
             update_reputation(stored_sender, 1)   # 1 = phishing → trust DOWN
             new_trust = get_trust_score(stored_sender)
             st.session_state.results["trust_score"] = new_trust
             st.session_state.results["trust_pct"]   = new_trust * 100
             st.session_state.reputation_msg = ("error",
-                f"🚨 Marked as Phishing. Trust updated: {new_trust*100:.1f}%")
+                f" Marked as Phishing. Trust updated: {new_trust*100:.1f}%")
 
         if st.session_state.reputation_msg:
             msg_type, msg_text = st.session_state.reputation_msg
@@ -418,25 +440,103 @@ if st.session_state.results:
 
         delta = prob_pct - text_prob_pct
         if delta > 0.5:
-            st.write("⬆️ Sender reputation **increased** phishing risk.")
+            st.write(" Sender reputation **increased** phishing risk.")
         elif delta < -0.5:
-            st.write("⬇️ Sender reputation **reduced** phishing risk.")
+            st.write(" Sender reputation **reduced** phishing risk.")
         else:
-            st.write("➡️ Sender reputation had minimal effect.")
+            st.write(" Sender reputation had minimal effect.")
 
     # ── TAB 7 — Top Word Signals ──────────────────────────────────────────────
+    # Shows which words in THIS specific email are driving the prediction.
+    # Score = TF-IDF weight × LGB gain. High score = word is both prominent
+    # in this email AND the model considers it highly informative.
 
     with tab7:
-        st.subheader("Top Word Signals")
-        st.caption("Ranked by training gain. 🔴 = present in submitted email.")
+        st.subheader("Why Did This Email Score That Way?")
+        st.caption(
+            "Words from **this email** ranked by influence on the prediction. "
+            "Score = how prominently the word appears × how informative the model finds it."
+        )
 
-        tfidf_importance, _ = get_feature_importance()
-        top_words    = sorted(tfidf_importance.items(), key=lambda x: x[1], reverse=True)[:20]
-        email_tokens = set(clean_text(st.session_state.get("email_text", "")).split())
+        if not word_scores:
+            st.info("No scoreable words found — email may be too short or contain no recognised vocabulary.")
+        else:
+            top_phishing = word_scores[:10]
+            # Bottom of the list = words that appear but have low/zero model gain
+            # Filter to only words that actually have some gain
+            scored = [(w, s, wt, g) for w, s, wt, g in word_scores if g > 0]
+            top_safe = scored[-8:] if len(scored) >= 8 else scored
 
-        for word, gain in top_words:
-            marker = "🔴" if word in email_tokens else "⬜"
-            st.write(f"{marker} **{word}** — gain: {gain:,.0f}")
+            col1, col2 = st.columns(2)
 
-        st.divider()
-        st.caption("🔴 present in this email   ⬜ not present")
+            with col1:
+                st.markdown("####  Pushing Toward Phishing")
+                st.caption("High-gain words the model associates with phishing that appear in this email.")
+
+                if top_phishing:
+                    words_p  = [w for w,s,wt,g in top_phishing]
+                    scores_p = [round(s, 1) for w,s,wt,g in top_phishing]
+
+                    fig = go.Figure(go.Bar(
+                        x=scores_p,
+                        y=words_p,
+                        orientation='h',
+                        marker_color='rgba(239,68,68,0.7)',
+                        marker_line_color='#ef4444',
+                        marker_line_width=1,
+                    ))
+                    fig.update_layout(
+                        height=320,
+                        xaxis_title="Influence Score",
+                        yaxis=dict(autorange="reversed"),
+                        margin=dict(l=0, r=10, t=10, b=30),
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        font=dict(color='#94a3b8'),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No strong phishing word signals found.")
+
+            with col2:
+                st.markdown("####  Pushing Toward Legitimate")
+                st.caption("Words present in this email that the model associates with legitimate emails.")
+
+                # Legitimate words = present in email but model gain is LOW
+                # (model doesn't flag them as phishing signals)
+                safe_words = [(w, s, wt, g) for w, s, wt, g in word_scores
+                              if wt > 0 and g < 5000]  # low-gain = not a phishing signal
+                safe_words.sort(key=lambda x: x[2], reverse=True)  # sort by TF-IDF weight
+                safe_top = safe_words[:10]
+
+                if safe_top:
+                    words_s  = [w for w,s,wt,g in safe_top]
+                    weights_s = [round(wt * 100, 2) for w,s,wt,g in safe_top]
+
+                    fig2 = go.Figure(go.Bar(
+                        x=weights_s,
+                        y=words_s,
+                        orientation='h',
+                        marker_color='rgba(34,197,94,0.7)',
+                        marker_line_color='#22c55e',
+                        marker_line_width=1,
+                    ))
+                    fig2.update_layout(
+                        height=320,
+                        xaxis_title="TF-IDF Weight (×100)",
+                        yaxis=dict(autorange="reversed"),
+                        margin=dict(l=0, r=10, t=10, b=30),
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        font=dict(color='#94a3b8'),
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
+                else:
+                    st.info("No strong legitimate word signals found.")
+
+            st.divider()
+            st.caption(
+                f"**{len(word_scores)}** words from this email matched the model vocabulary. "
+                "Phishing score = TF-IDF weight × training gain. "
+                "Legitimate score = words present but not flagged as phishing signals by the model."
+            )
